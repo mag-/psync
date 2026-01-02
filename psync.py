@@ -78,18 +78,11 @@ def blk_size(sz: int) -> int:
     if sz < 64<<30: return 128<<20     # <64GB: 128MB blocks
     return 1<<30                        # >=64GB: 1GB blocks
 
-# === Rolling Checksum (Adler-32 variant) ===
-def rolling(data: bytes | memoryview) -> tuple[int, int, int]:
-    """Compute rolling checksum: returns (a, b, weak) where weak = a + (b << 16)"""
-    a = sum(data) % M16
-    b = sum((len(data) - i) * data[i] for i in range(len(data))) % M16
-    return a, b, a + (b << 16)
-
-def roll(a: int, b: int, length: int, old: int, new: int) -> tuple[int, int, int]:
-    """O(1) update of rolling checksum when sliding window by 1 byte"""
-    a = (a - old + new) % M16
-    b = (b - length * old + a) % M16
-    return a, b, a + (b << 16)
+# === Weak Hash (xxhash32 - C-implemented, ~10GB/s) ===
+def weak_hash(data: bytes | memoryview) -> int:
+    """Fast 32-bit hash for block matching. Not rollable but very fast."""
+    if isinstance(data, memoryview): data = bytes(data)
+    return xxhash.xxh32_intdigest(data)
 
 # === Strong Hash (xxh3_128) ===
 def strong(data: bytes | memoryview) -> bytes:
@@ -110,55 +103,46 @@ def mmap_read(path: Path):
 
 # === Signatures & Delta ===
 def signatures(data: bytes | memoryview, bs: int) -> list[Sig]:
-    """Generate block signatures for basis file"""
+    """Generate block signatures for basis file using xxhash (10GB/s)"""
     if not data or bs == 0: return []
-    return [Sig(rolling(data[i:i+bs])[2], strong(data[i:i+bs]))
+    return [Sig(weak_hash(data[i:i+bs]), strong(data[i:i+bs]))
             for i in range(0, len(data), bs)]
 
 def delta(src: bytes | memoryview, sigs: list[Sig], bs: int) -> list[Delta]:
-    """Generate delta: list of block refs (int) or literal data (bytes)"""
+    """Generate delta using fast block-boundary matching.
+
+    Simple and fast: only check at block boundaries.
+    Unmatched blocks sent as literal. No byte-by-byte search."""
     if not src: return []
-    if not sigs or bs == 0: return [bytes(src)]  # no basis, send all
+    if not sigs or bs == 0: return [bytes(src)]
 
     # Build lookup: weak -> [(strong, idx), ...]
     lookup: dict[int, list[tuple[bytes, int]]] = defaultdict(list)
     for i, s in enumerate(sigs): lookup[s.weak].append((s.strong, i))
 
     result: list[Delta] = []
-    literal = bytearray()
-    pos, length = 0, len(src)
+    length = len(src)
 
-    if length < bs:
-        return [bytes(src)]
+    # Process block by block
+    for pos in range(0, length, bs):
+        block = src[pos:pos+bs]
+        if len(block) < bs:
+            # Final partial block - send as literal
+            result.append(bytes(block))
+            break
 
-    a, b, weak = rolling(src[:bs])
-
-    while pos <= length - bs:
+        weak = weak_hash(block)
         matched = False
         if weak in lookup:
-            block = src[pos:pos+bs]
             sh = strong(block)
             for sig_strong, idx in lookup[weak]:
                 if sig_strong == sh:
-                    if literal:
-                        result.append(bytes(literal))
-                        literal.clear()
                     result.append(idx)
-                    pos += bs
-                    if pos <= length - bs:
-                        a, b, weak = rolling(src[pos:pos+bs])
                     matched = True
                     break
 
         if not matched:
-            literal.append(src[pos])
-            if pos + bs < length:
-                a, b, weak = roll(a, b, bs, src[pos], src[pos + bs])
-            pos += 1
-
-    # Remaining bytes
-    if pos < length: literal.extend(src[pos:])
-    if literal: result.append(bytes(literal))
+            result.append(bytes(block))
 
     return result
 
@@ -329,6 +313,7 @@ class Args:
     update: bool = False
     server: bool = False
     pipe_out: bool = False
+    stats: bool = False
 
     def __post_init__(self):
         if self.archive:
@@ -355,6 +340,7 @@ def parse(argv: list[str]) -> Args:
         elif a in ('-u', '--update'): args.update = True
         elif a == '--server': args.server = True
         elif a == '--pipe-out': args.pipe_out = True
+        elif a == '--stats': args.stats = True
         elif a.startswith('-') and not a.startswith('--') and len(a) > 1:
             for c in a[1:]:
                 if c == 'a': args.archive = True
@@ -378,27 +364,34 @@ def parse(argv: list[str]) -> Args:
 
 # === Transport ===
 class Transport:
-    """Bidirectional transport over file handles"""
+    """Bidirectional transport over file handles with byte counting"""
     def __init__(self, stdin, stdout, compress: bool = True):
         self.stdin, self.stdout, self.compress = stdin, stdout, compress
+        self.bytes_sent = 0
+        self.bytes_recv = 0
 
     def send(self, typ: M, payload: bytes):
-        self.stdout.write(enc(typ, payload, self.compress))
+        data = enc(typ, payload, self.compress)
+        self.bytes_sent += len(data)
+        self.stdout.write(data)
         self.stdout.flush()
 
     def recv(self) -> tuple[M, bytes]:
-        return dec(self.stdin)
+        typ, payload = dec(self.stdin)
+        # Estimate received bytes (header + payload after decompression)
+        self.bytes_recv += 6 + len(payload)  # approximate
+        return typ, payload
 
 class SSHTransport(Transport):
     """SSH transport that bootstraps psync on remote"""
     def __init__(self, host: str, remote_path: str, compress: bool):
-        script = Path(__file__).read_text()
-        # Upload script and run server mode
-        cmd = f'ssh -o Compression=no {host} "cat > /tmp/_psync.py && uv run /tmp/_psync.py --server {shlex.quote(remote_path)}"'
-        self.proc = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE)
-        # Send script content
-        self.proc.stdin.write(script.encode())
-        self.proc.stdin.flush()
+        import base64
+        script = Path(__file__).read_bytes()
+        script_b64 = base64.b64encode(script).decode()
+        # Upload script via base64 (avoids stdin/EOF issues), then run server mode
+        remote_cmd = f'echo {script_b64} | base64 -d > /tmp/_psync.py && uv run /tmp/_psync.py --server {shlex.quote(remote_path)}'
+        cmd = ['ssh', '-o', 'Compression=no', host, remote_cmd]
+        self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
         super().__init__(self.proc.stdout, self.proc.stdin, compress)
 
     def close(self):
@@ -524,7 +517,7 @@ class Receiver:
             dst_path = self.root / path
             # Check if it's metadata for dir/symlink
             try:
-                meta = json.loads(payload.decode())
+                meta = json.loads(payload.decode('utf-8'))
                 fm = FileMeta.from_dict(meta)
                 if fm.is_dir:
                     dst_path.mkdir(parents=True, exist_ok=True)
@@ -533,8 +526,8 @@ class Receiver:
                     if dst_path.exists() or dst_path.is_symlink():
                         dst_path.unlink()
                     dst_path.symlink_to(fm.link_target)
-            except (json.JSONDecodeError, KeyError):
-                # Regular file data
+            except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+                # Regular file data (binary)
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 dst_path.write_bytes(payload)
             if self.args.verbose: print(f"  wrote: {path}", file=sys.stderr)
@@ -645,6 +638,9 @@ def main():
             Sender(args, tr, src).sync()
         finally:
             tr.close()
+        if args.stats:
+            print(f"\nTotal bytes sent: {tr.bytes_sent:,}", file=sys.stderr)
+            print(f"Total bytes received: {tr.bytes_recv:,}", file=sys.stderr)
     else:
         # Local sync
         local_sync(args)

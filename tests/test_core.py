@@ -32,46 +32,30 @@ class TestBlockSize:
         assert blk_size(4 * 1024 * 1024 * 1024) == 128 * 1024 * 1024  # 4GB -> 128MB blocks
 
 
-class TestRollingChecksum:
-    """Test Adler-32 variant rolling checksum"""
+class TestWeakHash:
+    """Test xxhash32 weak hash for block matching"""
 
-    def test_basic_checksum(self):
-        """Basic checksum computation"""
-        from psync import rolling
+    def test_basic_hash(self):
+        """Basic hash computation"""
+        from psync import weak_hash
         data = b"hello world"
-        a, b, weak = rolling(data)
-        assert isinstance(weak, int)
-        assert weak == a + (b << 16)
+        h = weak_hash(data)
+        assert isinstance(h, int)
+        assert h == weak_hash(data)  # deterministic
 
-    def test_roll_equivalence(self):
-        """Rolling should give same result as fresh computation"""
-        from psync import rolling, roll
-        data = b"hello world!"
-        block_sz = 5
+    def test_different_inputs(self):
+        """Different inputs should give different hashes"""
+        from psync import weak_hash
+        h1 = weak_hash(b"hello")
+        h2 = weak_hash(b"world")
+        assert h1 != h2
 
-        # Initial checksum of first 5 bytes
-        a1, b1, w1 = rolling(data[:block_sz])
-
-        # Roll to next position
-        a2, b2, w2 = roll(a1, b1, block_sz, data[0], data[block_sz])
-
-        # Fresh checksum of bytes 1-6
-        a3, b3, w3 = rolling(data[1:block_sz+1])
-
-        assert w2 == w3, "Rolling checksum should match fresh computation"
-
-    def test_roll_many_positions(self):
-        """Roll through entire buffer"""
-        from psync import rolling, roll
-        data = b"The quick brown fox jumps over the lazy dog"
-        block_sz = 8
-
-        a, b, weak = rolling(data[:block_sz])
-
-        for i in range(len(data) - block_sz):
-            a, b, weak = roll(a, b, block_sz, data[i], data[i + block_sz])
-            expected_a, expected_b, expected = rolling(data[i+1:i+1+block_sz])
-            assert weak == expected, f"Mismatch at position {i+1}"
+    def test_memoryview(self):
+        """Should handle memoryview input"""
+        from psync import weak_hash
+        data = b"hello world"
+        mv = memoryview(data)
+        assert weak_hash(mv) == weak_hash(data)
 
 
 class TestStrongHash:
