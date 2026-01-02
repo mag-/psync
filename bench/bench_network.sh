@@ -1,9 +1,9 @@
 #!/bin/bash
-# bench_network.sh - Benchmark adaptive compression at different network speeds
+# bench_network.sh - Compare psync adaptive compression vs rsync at different speeds
 set -e
 cd "$(dirname "$0")/.."
 
-B='\033[34m'; C='\033[36m'; RST='\033[0m'
+B='\033[34m'; G='\033[32m'; Y='\033[33m'; C='\033[36m'; RST='\033[0m'
 CORPUS="bench/silesia"
 PSYNC="./psync.py"
 
@@ -17,30 +17,27 @@ command -v pv >/dev/null || { echo "Install pv: apt install pv"; exit 1; }
     rm bench/silesia.zip
 }
 
-echo -e "${B}Adaptive Compression vs Network Speed${RST}"
+echo -e "${B}╔══════════════════════════════════════════════════════════════╗${RST}"
+echo -e "${B}║     psync (adaptive zstd) vs rsync (zlib) by Bandwidth       ║${RST}"
+echo -e "${B}╚══════════════════════════════════════════════════════════════╝${RST}"
 echo
 
 TD=$(mktemp -d)
 trap "rm -rf $TD" EXIT
 
 # Test configs: pv_rate, data_mb, display_name
-# Longer tests to see more adaptation
 TESTS=(
-    "500k:20:500 KB/s"
-    "2m:100:2 MB/s"
-    "10m:400:10 MB/s"
+    "1m:50:1 MB/s"
+    "5m:100:5 MB/s"
+    "20m:200:20 MB/s"
 )
-
-printf "%-12s %6s %8s %8s %8s %s\n" "Bandwidth" "Data" "Time" "Sent" "Ratio" "Compression"
-echo "──────────── ────── ──────── ──────── ──────── ────────────────────"
 
 for spec in "${TESTS[@]}"; do
     IFS=':' read -r RATE DATA_MB NAME <<< "$spec"
 
     # Create test data
     SRC="$TD/src_$DATA_MB"
-    DST="$TD/dst_$DATA_MB"
-    rm -rf "$SRC" "$DST"; mkdir -p "$SRC" "$DST"
+    rm -rf "$SRC"; mkdir -p "$SRC"
 
     TARGET=$((DATA_MB * 1024 * 1024))
     SIZE=0; N=0
@@ -56,37 +53,62 @@ for spec in "${TESTS[@]}"; do
     SRC_SIZE=$(du -sb "$SRC" | cut -f1)
     SRC_MB=$((SRC_SIZE / 1024 / 1024))
 
-    # FIFOs for bidirectional communication
-    S2R="$TD/s2r_$$"; R2S="$TD/r2s_$$"
-    rm -f "$S2R" "$R2S"
-    mkfifo "$S2R" "$R2S"
+    echo -e "${Y}━━━ ${NAME} (${SRC_MB}MB data) ━━━${RST}"
+    printf "  %-8s %8s %10s %8s %s\n" "Tool" "Time" "Sent" "Ratio" "Notes"
+    echo "  ──────── ──────── ────────── ──────── ─────────────────────"
 
-    # Receiver: reads from s2r, writes to r2s
-    uv run "$PSYNC" --server "$DST" < "$S2R" > "$R2S" 2>/dev/null &
-    RPID=$!
+    # === RSYNC over SSH (to enable compression) with bwlimit ===
+    DST="$TD/rsync_dst"
+    rm -rf "$DST"; mkdir -p "$DST"
 
-    # Sender with rate limit on output: reads from r2s, output through pv to s2r
-    # Capture stderr separately for stats
+    # rsync --bwlimit is in KiB/s: 1m=1MB/s=1024KiB/s
+    BW_KIB=$(echo "${RATE%m} * 1024" | bc)
     START=$(date +%s.%N)
-    uv run "$PSYNC" -vz --stats "$SRC/" --pipe-out < "$R2S" 2>"$TD/sender.log" | pv -q -L "$RATE" > "$S2R"
+    # Use localhost SSH so -z compression actually works
+    OUT=$(rsync -az --stats --bwlimit="$BW_KIB" -e "ssh -o StrictHostKeyChecking=no -o Compression=no" "$SRC/" "localhost:$DST/" 2>&1) || true
     END=$(date +%s.%N)
-    OUT=$(cat "$TD/sender.log")
-    wait $RPID 2>/dev/null || true
-    rm -f "$S2R" "$R2S"
 
     WALL=$(echo "$END - $START" | bc)
     SENT=$(echo "$OUT" | grep "Total bytes sent" | awk -F: '{gsub(/,/,"",$2); print $2}')
     SENT=${SENT:-$SRC_SIZE}
-    SENT_MB=$((SENT / 1024 / 1024))
+    SENT_MB=$(echo "scale=1; $SENT / 1024 / 1024" | bc)
+    RATIO=$(echo "scale=1; $SENT * 100 / $SRC_SIZE" | bc)
+    printf "  ${C}%-8s${RST} %6.1fs %8.1fMB %6.1f%% %s\n" "rsync" "$WALL" "$SENT_MB" "$RATIO" "zlib=6, bwlimit=${RATE}"
+
+    # === PSYNC ===
+    DST="$TD/psync_dst"
+    rm -rf "$DST"; mkdir -p "$DST"
+    S2R="$TD/s2r_p"; R2S="$TD/r2s_p"
+    rm -f "$S2R" "$R2S"; mkfifo "$S2R" "$R2S"
+
+    uv run "$PSYNC" --server "$DST" < "$S2R" > "$R2S" 2>/dev/null &
+    RPID=$!
+
+    START=$(date +%s.%N)
+    uv run "$PSYNC" -vz --stats "$SRC/" --pipe-out < "$R2S" 2>"$TD/psync.log" | pv -q -L "$RATE" > "$S2R"
+    END=$(date +%s.%N)
+    wait $RPID 2>/dev/null || true
+    rm -f "$S2R" "$R2S"
+
+    OUT=$(cat "$TD/psync.log")
+    WALL=$(echo "$END - $START" | bc)
+    SENT=$(echo "$OUT" | grep "Total bytes sent" | awk -F: '{gsub(/,/,"",$2); print $2}')
+    SENT=${SENT:-$SRC_SIZE}
+    SENT_MB=$(echo "scale=1; $SENT / 1024 / 1024" | bc)
     RATIO=$(echo "scale=1; $SENT * 100 / $SRC_SIZE" | bc)
 
-    # Extract compression level changes
-    LEVELS=$(echo "$OUT" | grep -oP '\[zstd\] level \d+→\d+' | tr '\n' ' ')
-    [ -z "$LEVELS" ] && LEVELS="level 3 (no change)"
+    # Get final level
+    FINAL_LEVEL=$(echo "$OUT" | grep -oP 'level \d+→\K\d+' | tail -1)
+    FINAL_LEVEL=${FINAL_LEVEL:-3}
+    CHANGES=$(echo "$OUT" | grep -c '\[zstd\]' || echo 0)
 
-    printf "%-12s %4dMB %6.1fs %6dMB %6.1f%% %s\n" \
-        "$NAME" "$SRC_MB" "$WALL" "$SENT_MB" "$RATIO" "$LEVELS"
+    printf "  ${G}%-8s${RST} %6.1fs %8.1fMB %6.1f%% %s\n" "psync" "$WALL" "$SENT_MB" "$RATIO" "zstd adaptive→$FINAL_LEVEL (${CHANGES} changes)"
+    echo
 done
 
-echo
-echo "Expected: Slower network → higher compression (more CPU headroom)"
+echo -e "${B}════════════════════════════════════════════════════════════════${RST}"
+echo -e "${B}Notes:${RST}"
+echo "  • rsync: fixed zlib level 6, SSH localhost, --bwlimit rate limiting"
+echo "  • psync: adaptive zstd (level 1-19), named pipes, pv rate limiting"
+echo "  • Lower ratio = better compression"
+echo -e "${B}════════════════════════════════════════════════════════════════${RST}"
