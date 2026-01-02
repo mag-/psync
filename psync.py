@@ -164,8 +164,83 @@ class M(IntEnum):
 PROTO_VER = 1
 COMPRESS_THRESH = 512
 
-# Compression (multi-threaded zstd)
-_cctx = zstd.ZstdCompressor(level=3, threads=-1)
+# Adaptive Compression (adjusts level based on CPU headroom)
+class AdaptiveCompressor:
+    """Zstd compressor that adapts level based on throughput.
+
+    If compression is fast (spare CPU), increase level for better ratio.
+    If compression is slow (CPU bound), decrease level for speed.
+    """
+    MIN_LEVEL, MAX_LEVEL, DEFAULT_LEVEL = 1, 19, 3
+    CHECK_INTERVAL = 0.1  # 100ms between level adjustments
+
+    def __init__(self):
+        self.level = self.DEFAULT_LEVEL
+        self._cctx = zstd.ZstdCompressor(level=self.level, threads=-1)
+        self._bytes_in = 0
+        self._bytes_out = 0
+        self._compress_time = 0.0
+        self._last_check = time.perf_counter()
+        self._last_throughput = 0.0
+        self.verbose = 0  # Set by caller
+
+    def compress(self, data: bytes) -> bytes:
+        t0 = time.perf_counter()
+        result = self._cctx.compress(data)
+        elapsed = time.perf_counter() - t0
+
+        self._bytes_in += len(data)
+        self._bytes_out += len(result)
+        self._compress_time += elapsed
+
+        # Check if we should adjust level
+        now = time.perf_counter()
+        if now - self._last_check >= self.CHECK_INTERVAL:
+            self._adjust_level()
+            self._last_check = now
+
+        return result
+
+    def _adjust_level(self):
+        """Adjust compression level based on CPU utilization.
+
+        Heuristic: measure compress_time / wall_time ratio.
+        - Low ratio = waiting for network = CPU headroom = increase level
+        - High ratio = CPU busy = decrease level
+        """
+        now = time.perf_counter()
+        wall_time = now - self._last_check
+        if wall_time < 0.1 or self._bytes_in == 0:
+            return
+
+        # CPU utilization = time spent compressing / wall time
+        cpu_util = self._compress_time / wall_time
+        ratio = self._bytes_out / max(self._bytes_in, 1)
+        throughput = self._bytes_in / max(self._compress_time, 0.001) / 1e6
+
+        old_level = self.level
+        if cpu_util < 0.2 and self.level < self.MAX_LEVEL:
+            # Less than 20% CPU = lots of headroom, increase aggressively
+            self.level = min(self.level + 2, self.MAX_LEVEL)
+        elif cpu_util < 0.5 and self.level < self.MAX_LEVEL:
+            # Less than 50% CPU = some headroom, increase
+            self.level = min(self.level + 1, self.MAX_LEVEL)
+        elif cpu_util > 0.8 and self.level > self.MIN_LEVEL:
+            # Over 80% CPU = bottleneck, decrease fast
+            self.level = max(self.level - 2, self.MIN_LEVEL)
+
+        if self.level != old_level:
+            self._cctx = zstd.ZstdCompressor(level=self.level, threads=-1)
+            if self.verbose:
+                print(f"  [zstd] level {old_level}→{self.level} "
+                      f"(cpu={cpu_util:.0%}, {throughput:.0f}MB/s, {ratio:.1%})", file=sys.stderr)
+
+        # Reset counters for next interval
+        self._bytes_in = 0
+        self._bytes_out = 0
+        self._compress_time = 0.0
+
+_cctx = AdaptiveCompressor()
 _dctx = zstd.ZstdDecompressor()
 
 def enc(typ: M, payload: bytes, compress: bool = True) -> bytes:
@@ -618,6 +693,7 @@ def local_sync(args: Args):
 # === Main ===
 def main():
     args = parse(sys.argv[1:])
+    _cctx.verbose = args.verbose  # Enable adaptive compression logging
 
     if args.server:
         # Server mode: receive from stdin, send to stdout
@@ -629,6 +705,9 @@ def main():
         src = Path(args.src.rstrip('/'))
         tr = Transport(sys.stdin.buffer, sys.stdout.buffer, args.compress)
         Sender(args, tr, src).sync()
+        if args.stats:
+            print(f"\nTotal bytes sent: {tr.bytes_sent:,}", file=sys.stderr)
+            print(f"Total bytes received: {tr.bytes_recv:,}", file=sys.stderr)
     elif ':' in args.dst:
         # Remote sync
         host, remote_path = args.dst.split(':', 1)
