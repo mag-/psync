@@ -1,0 +1,31 @@
+[project]
+name = "psync"
+version = "0.1.0"
+description = "Fast Python rsync clone"
+requires-python = ">=3.11"
+dependencies = [
+    "zstandard>=0.22",
+    "xxhash>=3.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.0",
+]
+
+[project.scripts]
+psync = "psync:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+addopts = "-v"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.0",
+]
